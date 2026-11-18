@@ -21,6 +21,8 @@
 #   - Run as root/sudo to read protected configs, keys, databases, and crontabs.
 #   - For a consistent snapshot, quiesce write-heavy services first (MySQL, Jellyfin,
 #     Stalwart, motionEye, and the feelin-it app/SQLite DB).
+#   - Renewal configs are captured as-is; setup converts any webroot challenges to
+#     the certbot nginx authenticator after the containers take over the web roots.
 #
 # Recreates this migration-pack backup from the current filesystem.
 

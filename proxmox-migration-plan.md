@@ -20,7 +20,7 @@
 ### Services
 | Service | Ports | Where it lives today | Move to |
 |---|---|---|---|
-| nginx (TLS reverse proxy, 17 vhosts) + certbot | 80/443 | host | **Proxmox host** |
+| nginx (TLS reverse proxy, 17 vhosts) + certbot (nginx-plugin HTTP-01) | 80/443 | host | **Proxmox host** |
 | WireGuard VPN (6 peers, `10.0.0.1/24`) | 51820/udp | host | **Proxmox host** |
 | Stalwart mail (`mail.wyattjohnson.net`) | 25,110,143,465,587,993,995,4190,8080 | host `/opt/stalwart` | **Proxmox host** |
 | MySQL 8 (13 app DBs + system DB) | 3306 | host | `ct-db` (.70), LAN-only |
@@ -72,7 +72,7 @@ Router 192.168.0.1 ── forwards: 80,443,25,110,143,465,587,993,995,4190,8080,
    │                    8096 → .73 · 8765 → .74
    │
 vmbr0 (bridged, enp5s0)
-   ├── Proxmox host 192.168.0.69   ← nginx+certbot, wireguard, stalwart, ssh, crontab
+   ├── Proxmox host 192.168.0.69   ← nginx+certbot (nginx plugin), wireguard, stalwart, ssh, crontab
    ├── ct-db         192.168.0.70  ← MySQL
    ├── ct-web        192.168.0.71  ← nginx+php-fpm, all PHP apps + Roundcube
    ├── ct-docker-web 192.168.0.72  ← Docker: feelin-it :3000, compatibility :8082
@@ -106,7 +106,7 @@ Create `/nas/migration-pack` on the 1T drive (`create-migration-pack.sh`). Copy:
 - [ ] `/var/www/*` (all app dirs, incl. `.env`, `storage/`) — for gas-mileage, web-dev-examples, webmail, suspicion this is the **only** source
 - [ ] MySQL: `mysqldump -u root -p --all-databases > all-databases.sql` (preserves users + all 13 app DBs; the restore/configure scripts skip the `mysql` system DB)
 - [ ] `/etc/nginx/` (sites-available, sites-enabled, conf.d, snippets)
-- [ ] `/etc/letsencrypt/` (live, archive, renewal, accounts)
+- [ ] `/etc/letsencrypt/` (live, archive, renewal, accounts, hooks); setup rewrites renewal configs from webroot to `authenticator = nginx` / `installer = nginx`
 - [ ] `/etc/wireguard/` (wg0.conf, server_*.key, clients/)
 - [ ] `/opt/stalwart/` (bin, etc, data, logs)
 - [ ] `/etc/samba/smb.conf`
@@ -141,7 +141,7 @@ Create `/nas/migration-pack` on the 1T drive (`create-migration-pack.sh`). Copy:
 apt install nginx certbot python3-certbot-nginx wireguard-tools curl \
   python3-requests python3-dotenv
 ```
-- [ ] **nginx + certs:** restore `/etc/nginx/` + `/etc/letsencrypt/` from migration pack. Enable and start `certbot.timer`; do not start nginx until the CTs are configured and `nginx-rewrite` runs.
+- [ ] **nginx + certs:** restore `/etc/nginx/` + `/etc/letsencrypt/` from migration pack, then convert every renewal config to the nginx authenticator/installer (`webroot` paths are no longer valid). Keep `certbot.timer` disabled until `nginx-rewrite` starts nginx and the renewal dry-run succeeds.
 - [ ] **DNS:** no local resolver exists today (systemd-resolved listens only on loopback); nothing to restore — LAN DNS stays on the router.
 - [ ] **WireGuard:** restore `/etc/wireguard/`, rewrite `-o enp5s0` in `wg0.conf` to the detected default interface, ensure `net.ipv4.ip_forward=1`, then `systemctl enable --now wg-quick@wg0` (verify 6 peers).
 - [ ] **Stalwart:** restore `/opt/stalwart/`, create system user `stalwart`, and extract the systemd unit from `stalwart.tar.gz` (`etc/systemd/system/stalwart.service`). Enable on boot. Disable `postfix`/`exim4`/`sendmail` if present. Preserves IPv6 mail listeners too.
@@ -206,7 +206,7 @@ SMB_SMBUSER_PASSWORD='...'
 - `/var/www` is restored from the pack; composer runs only when `vendor/autoload.php` is missing. Then `config:clear`, `storage:link`, `chown -R www-data:www-data /var/www`, install `ct-web.cron`, and start php8.4-fpm + nginx.
 - **.env change for every Laravel app:** `DB_HOST=192.168.0.70` (was `127.0.0.1`). Includes `sloppy-seconds` (DB `sloppy`).
 - **wyattjohnson / roundabout:** switch `DB_USERNAME` to `public_user` and copy the exact `DB_PASSWORD` line from `cardinal/.env`.
-- nginx inside ct-web serves each app on its server_name over `:80` (generated `server_name → root → fastcgi` blocks); host nginx proxies to it.
+- nginx inside ct-web mirrors the enabled host vhosts that are backed by `/var/www`, converted to HTTP-only `:80` server blocks with their original `server_name`, `root`, and locations; the config is generated from `$PACK/nginx.tar.gz` during `restore ct-web`. TLS stays on the host; ACME HTTP-01 is handled by the certbot nginx plugin on the host, never by container web roots. Proxy-only vhosts (feelin-it, compatible, movies, mail-admin) are excluded.
 - **Roundcube:** set `$config['db_dsnw']` host → `192.168.0.70`; set `imap_host` `localhost:143` → `192.168.0.69:143`; in ct-web `/etc/hosts` add `192.168.0.69 mail.wyattjohnson.net` so Roundcube reaches Stalwart on the host.
 - Static sites (web-dev-examples, suspicion, html) served from ct-web.
 
@@ -234,7 +234,7 @@ SMB_SMBUSER_PASSWORD='...'
 
 ## 9. Phase 6 — Rewrite host nginx vhosts to container upstreams
 
-Host nginx stays the TLS/ACME edge (certs unchanged). Per vhost, swap upstreams:
+Host nginx stays the TLS edge and the ACME HTTP-01 responder via the certbot nginx plugin (certs unchanged). Per vhost, swap upstreams:
 
 | vhost | today | new target |
 |---|---|---|
@@ -243,12 +243,13 @@ Host nginx stays the TLS/ACME edge (certs unchanged). Per vhost, swap upstreams:
 | movies | `proxy_pass http://192.168.0.69:8096` | `http://192.168.0.73:8096` |
 | mail-admin | `proxy_pass http://127.0.0.1:8080` | unchanged (stalwart on host) |
 | all PHP apps (cardinal, wyattjohnson, mycars, gsjohnson, money, photos, roundabout, suspicion, sloppy-seconds, web-dev, mail/Roundcube) | local root + `fastcgi_pass unix:...php8.4-fpm.sock` | `proxy_pass http://192.168.0.71` (per server_name) |
-| default /.well-known | `proxy_pass http://127.0.0.1:8080` | unchanged (or switch to webroot) |
+| default /.well-known | `proxy_pass http://127.0.0.1:8080` | unchanged; ACME handled by certbot nginx plugin (no webroot) |
 
+- ct-web receives the original host `server_name`/`root`/location rules over plain HTTP; its `/var/www/...` roots are valid inside the CT because `var-www.tar.gz` is restored there.
 - [ ] `nginx -t && systemctl reload nginx` (the script restarts nginx)
-- [ ] Run `certbot renew --dry-run` to confirm renewal still works from host.
+- [ ] Run `certbot renew --dry-run` to confirm renewal still works from host (the nginx plugin temporarily edits and reloads nginx; the script runs this in apply mode and then enables `certbot.timer`).
 - [ ] Automated equivalent: `sudo ./setup-from-migration-pack.sh nginx-rewrite --apply`
-- [ ] Then run `sudo ./setup-from-migration-pack.sh verify --apply --verify-live` (or just `verify --verify-live`; it is read-only).
+- [ ] Then run `sudo ./setup-from-migration-pack.sh verify --apply --verify-live` (or just `verify --verify-live`; it additionally checks that renewal configs use the nginx authenticator).
 
 ## 10. Phase 7 — Router & LAN changes
 - [ ] Reserve `.70–.75` in router DHCP (static leases).
