@@ -1168,7 +1168,7 @@ def find_blocks(text, pattern):
         cb = match_brace(text, ob)
         if cb == -1:
             continue
-        out.append((m.start(), cb + 1, text[m.start():cb + 1], text[ob + 1:cb]))
+        out.append((m.start(), cb + 1, m.group(0), text[ob + 1:cb]))
     return out
 
 
@@ -1308,8 +1308,8 @@ for base, data in enabled:
     if not servers:
         skipped.append("%s: no server blocks" % base)
         continue
-    for _start, _end, block, _inner in servers:
-        conf, reason = convert_block(block)
+    for _start, _end, _header, _inner in servers:
+        conf, reason = convert_block(clean[_start:_end])
         if conf:
             if conf not in seen_conf:
                 seen_conf.add(conf)
