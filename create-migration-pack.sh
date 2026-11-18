@@ -96,7 +96,6 @@ tar_if_exists "$DEST/nginx.tar.gz"       / etc/nginx
 tar_if_exists "$DEST/var-www.tar.gz"     / var/www
 tar_if_exists "$DEST/letsencrypt.tar.gz" / etc/letsencrypt
 tar_if_exists "$DEST/wireguard.tar.gz"   / etc/wireguard
-tar_if_exists "$DEST/jellyfin.tar.gz"    / var/lib/jellyfin
 
 # motionEye: configs, unit, and state
 tar_if_exists "$DEST/motioneye.tar.gz" / \
