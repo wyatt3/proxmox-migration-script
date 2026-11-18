@@ -298,7 +298,7 @@ resolve_template() {
   if command -v pveam >/dev/null 2>&1; then
     t=$( { pveam list local 2>/dev/null || true; } | awk '/ubuntu-24.04-standard/{print $1}' | sort -V | tail -n1)
     if [ -z "$t" ]; then
-      t=$( { pveam available --section system 2>/dev/null || true; } | awk '/ubuntu-24.04-standard/{print $1}' | sort -V | tail -n1)
+      t=$( { pveam available --section system 2>/dev/null || true; } | awk '/ubuntu-24.04-standard/{print $2}' | sort -V | tail -n1)
     fi
   fi
   echo "$t"
