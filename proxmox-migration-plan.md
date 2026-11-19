@@ -104,7 +104,7 @@ Peak-risk: Jellyfin transcode + 2 camera streams simultaneously can saturate 12 
 
 Create `/nas/migration-pack` on the 1T drive (`create-migration-pack.sh`). Copy:
 - [ ] `/var/www/*` (all app dirs, incl. `.env`, `storage/`) — for gas-mileage, web-dev-examples, webmail, suspicion this is the **only** source
-- [ ] MySQL: `mysqldump -u root -p --all-databases > all-databases.sql` (preserves users + all 13 app DBs; the restore/configure scripts skip the `mysql` system DB)
+- [ ] MySQL: `sudo ./create-migration-pack.sh` prompts for the root password and runs `mysqldump --all-databases` (or set `MYSQL_PWD`/`MYSQL_AUTH` for unattended runs); preserves users + all 13 app DBs; the restore/configure scripts skip the `mysql` system DB
 - [ ] `/etc/nginx/` (sites-available, sites-enabled, conf.d, snippets)
 - [ ] `/etc/letsencrypt/` (live, archive, renewal, accounts, hooks); setup rewrites renewal configs from webroot to `authenticator = nginx` / `installer = nginx`
 - [ ] `/etc/wireguard/` (wg0.conf, server_*.key, clients/)

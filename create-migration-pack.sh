@@ -8,17 +8,23 @@
 #
 # Environment variables:
 #   HOME_USER      Alternate way to set the home user (arg takes precedence)
-#   MYSQL_AUTH     Extra auth args for mysql/mysqldump (e.g. '--defaults-file=/root/.my.cnf' or '-uroot -psecret')
+#   MYSQL_PWD      MySQL root password for non-interactive runs (preferred; not stored in the pack)
+#   MYSQL_AUTH     Extra auth args for mysql/mysqldump (e.g. '--defaults-file=/root/.my.cnf')
 #   FEELIN_DB_PATH Override path to feelin-it SQLite DB
 #                  (default: /var/lib/docker/volumes/feelin-it_feelin-it-data/_data/feelin-it.db)
 #
 # Examples:
 #   sudo ./create-migration-pack.sh
 #   sudo ./create-migration-pack.sh /nas/migration-pack-new wyatt
+#   sudo MYSQL_PWD='secret' ./create-migration-pack.sh
 #   sudo MYSQL_AUTH='--defaults-file=/root/.my.cnf' ./create-migration-pack.sh
 #
 # Notes:
 #   - Run as root/sudo to read protected configs, keys, databases, and crontabs.
+#   - With an interactive TTY, the script prompts for the MySQL root password unless
+#     MYSQL_PWD or MYSQL_AUTH is set; unattended runs must set one of them.
+#   - MYSQL_PWD is passed via the environment to mysql/mysqldump and cleared afterward;
+#     it is never written to the migration pack.
 #   - For a consistent snapshot, quiesce write-heavy services first (MySQL, Jellyfin,
 #     Stalwart, motionEye, and the feelin-it app/SQLite DB).
 #   - Renewal configs are captured as-is; setup converts any webroot challenges to
@@ -32,16 +38,26 @@ DEST="${1:-/nas/migration-pack}"
 HOME_USER="${2:-${HOME_USER:-wyatt}}"
 HOME_DIR="$(getent passwd "$HOME_USER" | cut -d: -f6 2>/dev/null || echo "/home/$HOME_USER")"
 
-# shellcheck disable=SC2206
-MYSQL_AUTH_ARR=(${MYSQL_AUTH:-})
-
 umask 077
 mkdir -p "$DEST"
 
 log() { printf '[*] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
+die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+MYSQL_AUTH_ARR=()
+if [ -n "${MYSQL_AUTH:-}" ]; then
+  # shellcheck disable=SC2206
+  MYSQL_AUTH_ARR=(${MYSQL_AUTH})
+fi
+
+if [ -z "${MYSQL_PWD:-}" ] && [ ${#MYSQL_AUTH_ARR[@]} -eq 0 ]; then
+  [ -t 0 ] || die "MySQL root password required: set MYSQL_PWD or MYSQL_AUTH (no TTY)"
+  read -r -s -p "MySQL root password: " MYSQL_PWD
+  printf '\n'
+fi
 
 copy_file() {
   local src="$1" dst="$2"
@@ -132,28 +148,46 @@ else
 fi
 
 log "MySQL/MariaDB exports"
-if have mysqldump; then
-  mysqldump "${MYSQL_AUTH_ARR[@]}" --all-databases --routines --triggers --events \
-    > "$DEST/all-databases.sql" 2>/dev/null || warn "mysqldump failed (check credentials/permissions)"
-else
-  warn "mysqldump not found"
+have mysqldump || die "mysqldump not found (install the MariaDB/MySQL client package)"
+have mysql || die "mysql client not found (install the MariaDB/MySQL client package)"
+
+[ -z "${MYSQL_PWD:-}" ] || export MYSQL_PWD
+
+if ! mysql "${MYSQL_AUTH_ARR[@]}" -NBe 'SELECT 1' >/dev/null 2>&1; then
+  die "MySQL authentication failed (check the root password or MYSQL_AUTH)"
 fi
 
-if have mysql; then
-  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT user,host,plugin,authentication_string FROM mysql.user ORDER BY user,host" \
-    > "$DEST/mysql-users.txt" 2>/dev/null || warn "mysql user listing failed"
+write_mysql_output() {
+  local out="$1" tmp="$1.tmp.$$"
+  shift
+  if "$@" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$out"
+  else
+    rm -f "$tmp" "$out"
+    die "failed to create $out (check MySQL credentials/permissions)"
+  fi
+}
 
-  # Best-effort exports; formatting may differ from prior manual captures.
-  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT CONCAT('SHOW CREATE USER ''',user,'''\@''',host,''';') FROM mysql.user" \
+mysql_create_users_sql() {
+  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT CONCAT('SHOW CREATE USER ''',user,'''\@''',host,''';') FROM mysql.user" 2>/dev/null \
     | mysql "${MYSQL_AUTH_ARR[@]}" -NBr 2>/dev/null \
-    | sed 's/$/;/' > "$DEST/mysql-create-users.sql" || warn "mysql-create-users export failed"
+    | sed 's/$/;/'
+}
 
-  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT CONCAT('SHOW GRANTS FOR ''',user,'''\@''',host,''';') FROM mysql.user" \
+mysql_grants_sql() {
+  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT CONCAT('SHOW GRANTS FOR ''',user,'''\@''',host,''';') FROM mysql.user" 2>/dev/null \
     | mysql "${MYSQL_AUTH_ARR[@]}" -NBr 2>/dev/null \
-    | sed 's/$/;/' > "$DEST/mysql-grants.sql" || warn "mysql-grants export failed"
-else
-  warn "mysql client not found"
-fi
+    | sed 's/$/;/'
+}
+
+write_mysql_output "$DEST/all-databases.sql" \
+  mysqldump "${MYSQL_AUTH_ARR[@]}" --all-databases --routines --triggers --events
+write_mysql_output "$DEST/mysql-users.txt" \
+  mysql "${MYSQL_AUTH_ARR[@]}" -NBe "SELECT user,host,plugin,authentication_string FROM mysql.user ORDER BY user,host"
+write_mysql_output "$DEST/mysql-create-users.sql" mysql_create_users_sql
+write_mysql_output "$DEST/mysql-grants.sql" mysql_grants_sql
+
+unset MYSQL_PWD
 
 log "feelin-it SQLite database"
 FEELIN_SRC="${FEELIN_DB_PATH:-/var/lib/docker/volumes/feelin-it_feelin-it-data/_data/feelin-it.db}"
