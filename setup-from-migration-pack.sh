@@ -1273,12 +1273,13 @@ def convert_block(block):
                 addition = []
                 if not has_include:
                     addition.append("    include snippets/fastcgi-php.conf;")
+		addition.append("    fastcgi_param HTTPS on;")
                 addition.append("    fastcgi_pass unix:/run/php/php8.4-fpm.sock;")
                 replacements.append((end - 1, end - 1, "\n" + "\n".join(addition) + "\n"))
         body = replace_spans(body, replacements)
 
     body = re.sub(r"(?m)^(\s*)fastcgi_pass\s+[^;]+;", r"\1fastcgi_pass unix:/run/php/php8.4-fpm.sock;", body)
-    body = "listen 80;\nfastcgi_param HTTPS on;\n" + body
+    body = "listen 80;\n" + body
     body = re.sub(r"\n{3,}", "\n\n", body).strip("\n")
     indented = "\n".join("    " + line if line.strip() else "" for line in body.splitlines())
     return "server {\n" + indented + "\n}\n", None
