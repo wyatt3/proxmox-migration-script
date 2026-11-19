@@ -1273,7 +1273,7 @@ def convert_block(block):
                 addition = []
                 if not has_include:
                     addition.append("    include snippets/fastcgi-php.conf;")
-		addition.append("    fastcgi_param HTTPS on;")
+                addition.append("    fastcgi_param HTTPS on;")
                 addition.append("    fastcgi_pass unix:/run/php/php8.4-fpm.sock;")
                 replacements.append((end - 1, end - 1, "\n" + "\n".join(addition) + "\n"))
         body = replace_spans(body, replacements)
