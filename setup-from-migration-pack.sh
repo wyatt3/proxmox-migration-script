@@ -792,7 +792,6 @@ phase_host() {
   log "Restoring configs from pack"
   run tar -xzf "$PACK/nginx.tar.gz" -C /
   run tar -xzf "$PACK/letsencrypt.tar.gz" -C /
-  convert_certbot_renewals_to_nginx
   run tar -xzf "$PACK/wireguard.tar.gz" -C /
   run tar -xzf "$PACK/stalwart.tar.gz" -C /
   run chown -R stalwart:stalwart /opt/stalwart
@@ -2225,7 +2224,6 @@ phase_nginx_rewrite() {
 
   run nginx -t
   run systemctl restart nginx
-  run certbot renew --dry-run
   run systemctl enable --now certbot.timer
   ok "nginx rewrite complete"
 }
