@@ -667,24 +667,25 @@ PY
   esac
 }
 
-convert_certbot_renewals_to_nginx() {
+convert_certbot_renewals_to_webroot() {
   local dir=/etc/letsencrypt/renewal
+  local webroot=/var/www/certbot
   if [ "$APPLY" -eq 0 ]; then
-    printf '    %s[dry-run]%s convert certbot renewal configs in %s to the nginx authenticator\n' "$C_YEL" "$C_RST" "$dir"
+    printf '    %s[dry-run]%s convert certbot renewal configs in %s to shared webroot %s\n' "$C_YEL" "$C_RST" "$dir" "$webroot"
     if [ -d "$dir" ]; then
-      grep -H -E '^[[:space:]]*(authenticator|installer|webroot_root|webroot_map)[[:space:]]*=' "$dir"/*.conf 2>/dev/null || true
+      grep -H -E '^[[:space:]]*(authenticator|installer|webroot_(root|path|map))[[:space:]]*=' "$dir"/*.conf 2>/dev/null || true
     fi
     return 0
   fi
   [ -d "$dir" ] || die "certbot renewal dir missing: $dir"
 
-  python3 - "$dir" <<'PY'
+  python3 - "$dir" "$webroot" <<'PY'
 import os
 import re
 import sys
 from pathlib import Path
 
-renewal_dir = Path(sys.argv[1])
+renewal_dir, webroot = Path(sys.argv[1]), sys.argv[2]
 configs = sorted(renewal_dir.glob("*.conf"))
 if not configs:
     print("no certbot renewal configs found")
@@ -697,6 +698,7 @@ for path in configs:
     in_webroot_map = False
     saw_authenticator = False
     saw_installer = False
+    saw_webroot_path = False
 
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
@@ -712,28 +714,29 @@ for path in configs:
         if in_webroot_map:
             continue
         if re.match(r"^\s*authenticator\s*=", line):
+            if not saw_authenticator:
+                out.append("authenticator = webroot\n")
             saw_authenticator = True
-            if re.match(r"^\s*authenticator\s*=\s*nginx\s*(?:#.*)?$", line.rstrip("\n")):
-                out.append(line)
-            else:
-                out.append("authenticator = nginx\n")
             continue
         if re.match(r"^\s*installer\s*=", line):
+            if not saw_installer:
+                out.append("installer = None\n")
             saw_installer = True
-            if re.match(r"^\s*installer\s*=\s*nginx\s*(?:#.*)?$", line.rstrip("\n")):
-                out.append(line)
-            else:
-                out.append("installer = nginx\n")
             continue
-        if re.match(r"^\s*webroot_(?:root|map)\s*=", line):
+        if re.match(r"^\s*webroot_(?:path|root|map)\s*=", line):
+            if not saw_webroot_path:
+                out.append("webroot_path = %s,\n" % webroot)
+            saw_webroot_path = True
             continue
         out.append(line)
 
     additions = []
     if not saw_authenticator:
-        additions.append("authenticator = nginx\n")
+        additions.append("authenticator = webroot\n")
     if not saw_installer:
-        additions.append("installer = nginx\n")
+        additions.append("installer = None\n")
+    if not saw_webroot_path:
+        additions.append("webroot_path = %s,\n" % webroot)
     if additions:
         insert_at = next(
             (i for i, line in enumerate(out) if line.strip() == "[renewalparams]"),
@@ -747,16 +750,18 @@ for path in configs:
 
     new_text = "".join(out)
     if new_text != text:
-        mode = path.stat().st_mode
+        backup = path.with_name(path.name + ".bak")
+        if not backup.exists():
+            backup.write_text(text)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(new_text)
-        os.chmod(tmp, mode)
+        os.chmod(tmp, path.stat().st_mode)
         os.replace(tmp, path)
         changed += 1
 
-print("converted %d certbot renewal config(s) to nginx" % changed)
+print("converted %d certbot renewal config(s) to shared webroot %s" % (changed, webroot))
 PY
-  ok "certbot renewal configs now use the nginx authenticator"
+  ok "certbot renewal configs now use shared webroot $webroot"
 }
 
 phase_host() {
@@ -792,6 +797,16 @@ phase_host() {
   log "Restoring configs from pack"
   run tar -xzf "$PACK/nginx.tar.gz" -C /
   run tar -xzf "$PACK/letsencrypt.tar.gz" -C /
+  convert_certbot_renewals_to_webroot
+  run install -d -o root -g www-data -m 0755 /var/www/certbot/.well-known/acme-challenge
+  if [ "$APPLY" -eq 1 ]; then
+    install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+    printf '#!/bin/sh\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+    ok "installed certbot deploy hook: reload nginx"
+  else
+    printf '    %s[dry-run]%s install certbot deploy hook: reload nginx\n' "$C_YEL" "$C_RST"
+  fi
   run tar -xzf "$PACK/wireguard.tar.gz" -C /
   run tar -xzf "$PACK/stalwart.tar.gz" -C /
   run chown -R stalwart:stalwart /opt/stalwart
@@ -2193,8 +2208,77 @@ for s, e in location_slash_blocks(text):
     out.append(block)
     last = e
 out.append(text[last:])
-open(path, 'w').write(''.join(out))
+  open(path, 'w').write(''.join(out))
+ PY
+}
+
+ensure_shared_acme_webroot() {
+  local file=/etc/nginx/sites-enabled/default
+  local webroot=/var/www/certbot
+  if [ "$APPLY" -eq 0 ]; then
+    printf '    %s[dry-run]%s install shared ACME webroot location in %s\n' "$C_YEL" "$C_RST" "$file"
+    return 0
+  fi
+
+  python3 - "$file" "$webroot" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path, webroot = Path(sys.argv[1]), sys.argv[2]
+shared = """server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root %s;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+""" % webroot
+
+def matching(s, open_idx):
+    depth = 0
+    i = open_idx
+    while i < len(s):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+text = path.read_text() if path.exists() else ""
+out = []
+last = 0
+replaced = False
+for m in re.finditer(r"\bserver\s*\{", text):
+    ob = m.end() - 1
+    cb = matching(text, ob)
+    if cb == -1:
+        continue
+    block = text[m.start():cb + 1]
+    if re.search(r"(?m)^\s*listen\s+(?:\[[^\]]+\]:)?80(?=\s|;)", block) and not re.search(r"(?m)^\s*listen\s+443\b", block):
+        out.append(text[last:m.start()])
+        out.append(shared)
+        last = cb + 1
+        replaced = True
+        break
+
+out.append(text[last:])
+new_text = "".join(out) if replaced else shared + "\n" + "".join(out)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(new_text)
 PY
+  ok "shared ACME webroot configured in $file"
 }
 
 phase_nginx_rewrite() {
@@ -2224,8 +2308,10 @@ phase_nginx_rewrite() {
     fi
   done
 
+  ensure_shared_acme_webroot
   run nginx -t
   run systemctl restart nginx
+  run certbot renew --dry-run
   run systemctl enable --now certbot.timer
   ok "nginx rewrite complete"
 }
@@ -2260,19 +2346,19 @@ phase_verify() {
     local conf bad=0
     for conf in /etc/letsencrypt/renewal/*.conf; do
       [ -e "$conf" ] || continue
-      if grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*webroot' "$conf" ||
-         grep -Eq '^[[:space:]]*webroot_(root|map)[[:space:]]*=' "$conf" ||
+      if ! grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*webroot' "$conf" ||
+         ! grep -Eq '^[[:space:]]*webroot_path[[:space:]]*=[[:space:]]*/var/www/certbot,?[[:space:]]*$' "$conf" ||
          grep -Eq '^[[:space:]]*\[\[webroot_map\]\]' "$conf"; then
-        warn "certbot renewal still uses webroot: $conf"
-        bad=1
-      elif ! grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*nginx' "$conf" ||
-           ! grep -Eq '^[[:space:]]*installer[[:space:]]*=[[:space:]]*nginx' "$conf"; then
-        warn "certbot renewal not configured for nginx plugin: $conf"
+        warn "certbot renewal not using shared webroot /var/www/certbot: $conf"
         bad=1
       fi
     done
+    if [ ! -x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx ]; then
+      warn "certbot nginx reload deploy hook missing"
+      bad=1
+    fi
     if [ "$bad" -eq 0 ]; then
-      ok "certbot renewals use the nginx authenticator"
+      ok "certbot renewals use shared webroot /var/www/certbot"
     fi
   fi
 
