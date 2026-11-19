@@ -2208,8 +2208,8 @@ for s, e in location_slash_blocks(text):
     out.append(block)
     last = e
 out.append(text[last:])
-  open(path, 'w').write(''.join(out))
- PY
+open(path, 'w').write(''.join(out))
+PY
 }
 
 ensure_shared_acme_webroot() {
