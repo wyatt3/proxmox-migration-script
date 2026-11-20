@@ -2312,7 +2312,6 @@ phase_nginx_rewrite() {
   ensure_shared_acme_webroot
   run nginx -t
   run systemctl restart nginx
-  run certbot renew --dry-run
   run systemctl enable --now certbot.timer
   ok "nginx rewrite complete"
 }
